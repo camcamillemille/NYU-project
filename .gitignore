@@ -1,0 +1,24 @@
+# Ignore data, results, and local environments
+data/
+results/
+myenv/
+.env/
+venv/
+drafts/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS-specific or editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
