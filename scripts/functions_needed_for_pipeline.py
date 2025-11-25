@@ -1,5 +1,3 @@
-##ALL THE FUNCTIONS NEEDED FOR THE PIPELINE
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,15 +5,14 @@ import matplotlib.lines as mlines
 import matplotlib.gridspec as gridspec
 from matplotlib.ticker import MultipleLocator, FuncFormatter
 import seaborn as sns
-from scipy.stats import hypergeom
-from scipy.spatial.distance import jensenshannon
 from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import linear_sum_assignment
 from sklearn.decomposition import PCA
-from sklearn.metrics import pairwise_distances
+from sklearn.metrics import pairwise_distances, silhouette_score
 from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler,normalize
 from sklearn.impute import KNNImputer
-from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score, fowlkes_mallows_score
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score, pairwise_distances
 from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.manifold import TSNE
 import umap
@@ -27,34 +24,18 @@ warnings.filterwarnings('ignore')
 from sklearn.cluster import KMeans
 from mpl_toolkits.mplot3d import Axes3D 
 
-pd.set_option("display.max_columns", None)  # None = no limit for when i do df.head()
-
-
-##LIST CONTAINITNG THE GROUPS NAMES 
-treatment_groups = [
-        'BT474_mV_72hNHWD',
-        'BT474_mV_72hSTC15',
-        'BT474_mV_high_Untreated',
-        'BT474_mV_low_Untreated',
-        'BT474_mV_Untreated_Unsorted']
-
-## ARBITRARY CHOSEN COLORS FOR THE CLUSTERS (THEY NEED TO HAVE A HIGH VALUE AND CHROMA TO STAND OUT ON A GREY BACKGROUND)
-hex_colors = [
-    "#0e67a7", "#ff7f0e", "#a0e468", "#d62728", "#9467bd",
-    "#672417", "#e377c2", "#f5f523", "#28e0f5", "#3214a8",
-    "#ca9d16", "#04a887"
-]
 
 #MANUALLY RECALCULATING POL2 POSITION AS THE MIDPOINT BETWEEN MOTIF_START AND MOTIF_END
 def calculate_pol2_position(df):
     """Calculate the Pol II position as the midpoint between motif_start and motif_end."""
     if 'motif_start' in df.columns and 'motif_end' in df.columns:
-        df['pol2_pos']= (df['motif_start'] + df['motif_end']) / 2
+        df['pol2_pos'] = ((pd.to_numeric(df['motif_start'], errors='coerce') +
+                                 pd.to_numeric(df['motif_end'], errors='coerce')) / 2).round().astype('Int64')
     else:
         raise ValueError("DataFrame must contain 'motif_start' and 'motif_end' columns.")
     return df
 
-## PREPROCESS OF THE DATAFRAME FUNCTION
+## 1. PREPROCESS OF THE DATAFRAME FUNCTION
 
 def preprocess_dataframe(
     df: pd.DataFrame,
@@ -112,10 +93,23 @@ def preprocess_dataframe(
     if 'pol2' in df_proc.columns:
         mapping_pol2 = {"pol2":1, "nonpol2":0}
         df_proc["pol2"] = df_proc["pol2"].map(mapping_pol2)
+    else:
+        print("'pol2' column not found; skipping conversion to binary marker.")
 
     # Create gene_tss column if columns exist
     if "gene" in df_proc.columns and "tss_pos" in df_proc.columns:
         df_proc["gene_tss"] = df_proc["gene"].astype(str) + "_" + df_proc["tss_pos"].astype(str)
+        print('Gene_tss created from gene and tss_pos columns')
+    else:
+        # fallback if gene/tss_pos not present
+        rid_col = 'readid' if 'readid' in df_proc.columns else None
+        cstart_col = 'C_start' if 'C_start' in df_proc.columns else None
+        if rid_col and cstart_col:
+            df_proc['gene_tss'] = df_proc[rid_col].astype(str) + "_" + df_proc[cstart_col].astype(str)
+            print('Gene_tss created from readid and C_start columns')
+        else:
+            # final fallback
+            print('ERROR: Could not create gene_tss; required columns missing.')
 
     # Drop duplicates again after transformations
     df_proc = df_proc.drop_duplicates()
@@ -126,7 +120,7 @@ def preprocess_dataframe(
     return df_proc
 
 
-##FUNCTION TO FILTER ONLY THE GENES THAT HAVE SUFFICIENT READS THAT OVERLAP ON THE SAME GENOMIC REGION, CENTERED ON THE MIDDLE
+## 2. FUNCTION TO FILTER ONLY THE GENES THAT HAVE SUFFICIENT READS THAT OVERLAP ON THE SAME GENOMIC REGION, CENTERED ON THE MIDDLE
 ## THE INPUT DF MUST BE BINNED
 
 def filter_reads_per_gene_middle_bin_name(
@@ -256,8 +250,7 @@ def filter_reads_per_gene_middle_bin_name(
     return df_filtered, filtered_regions
 
 
-
-##BINNING THE DATAFRAME AND TURNING IT INTO MATRIX FORM
+## 3. BINNING THE DATAFRAME AND TURNING IT INTO MATRIX FORM
 # TO BE CALLED IN A FUNCITON, NO USE ALONE
 
 def bin_then_matrix(
@@ -296,7 +289,7 @@ def bin_then_matrix(
         return df
 
 
-## PROCESSING -- MARKING THE METHYLATION OF READS BY BINNED REGIONS -- GIVING OUT A DATAFRAME
+## 4. PROCESSING -- MARKING THE METHYLATION OF READS BY BINNED REGIONS -- GIVING OUT A DATAFRAME
 
 def process_into_matrix(
         df: pd.DataFrame,
@@ -336,7 +329,11 @@ def process_into_matrix(
         df= bin_then_matrix(df, indexes= ['readid','group','cluster'], bin_size= bin_size)
 
     else:
-        df = bin_then_matrix(df, indexes= ['gene_tss','readid','group','cluster'], bin_size= bin_size)
+        if 'cluster' not in df.columns:
+            index_list = ['gene_tss','readid','group']
+        else:
+            index_list = ['gene_tss','readid','group','cluster']
+        df = bin_then_matrix(df, indexes= index_list, bin_size= bin_size)
 
      
     print(f"Shape of the dataframe : {df.shape}")
@@ -344,7 +341,7 @@ def process_into_matrix(
     return df
 
 
-## TO HANDLE THE NAN VALUES ONCE IN MATRIX FORM
+## 5. TO HANDLE THE NAN VALUES ONCE IN MATRIX FORM
 
 def handling_NaN(
         df: pd.DataFrame, # must be binned and in matrix form
@@ -397,32 +394,74 @@ def handling_NaN(
         return df
 
 
-def preprocess_long_for_plot(df, include_locus_cluster: bool = False):
+##6. FUNCTION TO PREPARE THE DATAFRAME IN LONG FORMAT FOR PLOTTING READS
+
+def preprocess_long_for_plot(
+    df: pd.DataFrame,
+    include_locus_cluster: bool = False,
+    # --- Filtering options ---
+    filter_outliers: bool = False,
+    max_span_bp: float | None = None,   # e.g., 4000; if None, use span_quantile
+    span_quantile: float = 0.99,        # used if max_span_bp is None
+    require_center_inside: bool = True, # enforce read_start <= pol2_pos <= read_end
+    min_cpg: int = 1,                   # minimum CpGs per read
+    cpg_window_bp: float | None = None, # constrain CpGs to ±window around center
+    return_stats: bool = False          # optionally return per-read stats
+):
     """
-    Prepare dataframe in long format for plotting reads.
-    Each row = one CpG per read.
+    Prepare a long-format DataFrame for plotting reads (one row per CpG per read),
+    and optionally drop problematic reads (extreme spans, miscentered, or too few CpGs).
 
     Parameters
     ----------
-    df : pd.DataFrame
-        Input dataframe with columns at least ['gene_tss', 'group', 'cluster', 'pol2_pos', "readid", "C_start", "meth", 'locus_cluster'].
-    include_locus_cluster : bool, optional
-        If True, keep 'locus_cluster' column (for plotting after clustering).
-        If False, ignore it.
+    df : pandas.DataFrame
+        Input DataFrame with at least these columns:
+        ['gene_tss', 'group', 'readid', 'cluster', 'C_start', 'meth', 'pol2_pos'].
+    include_locus_cluster : bool, default=False
+        If True and 'locus_cluster' is present, it will be retained.
+    filter_outliers : bool, default=False
+        Whether to apply filtering of problematic reads based on read span, centering, etc.
+    max_span_bp : float or None, default=None
+        Maximum allowed span of reads in base pairs. If None, uses span_quantile.
+    span_quantile : float, default=0.99
+        Quantile used to determine span threshold if max_span_bp is None.
+    require_center_inside : bool, default=True
+        Whether to enforce that each read covers the center position (0).
+    min_cpg : int, default=1
+        Minimum number of CpG sites required per read.
+    cpg_window_bp : float or None, default=None
+        If provided, constrains CpGs to lie within ±window around center.
+    return_stats : bool, default=False
+        If True, return per-read stats alongside the filtered DataFrame.
+
+    Returns
+    -------
+    df_clean : pandas.DataFrame
+        Processed DataFrame ready for plotting.
+    stats : pandas.DataFrame, optional
+        Per-read statistics if return_stats=True.
     """
-    df = df.reset_index(drop=True)  # ensure features are columns
-    
-    # Define base columns
-    base_cols = ["gene_tss", "group", "readid", "cluster", "C_start", "meth",'pol2_pos']
+
+    # --- Initial cleanup ---
+    df = df.reset_index(drop=True).copy()
+
+    # --- Keep relevant columns ---
+    base_cols = ["gene_tss", "group", "readid", "cluster", "C_start", "meth", "pol2_pos"]
     keep_cols = [c for c in df.columns if c in base_cols]
 
-    # Optionally add locus_cluster if it exists
     if include_locus_cluster and "locus_cluster" in df.columns:
         keep_cols.append("locus_cluster")
 
     df = df[keep_cols]
 
-    # Compute per-read start/end (no lists!)
+    # --- Ensure numeric types ---
+    for c in ["C_start", "pol2_pos"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # --- Drop rows missing essentials ---
+    df = df.dropna(subset=["readid", "C_start", "pol2_pos"])
+
+    # --- Compute per-read min/max span (from CpG coordinates) ---
     span = (
         df.groupby("readid")["C_start"]
         .agg(["min", "max"])
@@ -430,8 +469,65 @@ def preprocess_long_for_plot(df, include_locus_cluster: bool = False):
     )
     df = df.merge(span, on="readid", how="left")
 
-    return df
+    # --- Compute per-read center (first pol2_pos per read) ---
+    df["center"] = df.groupby("readid")["pol2_pos"].transform("first")
 
+    # --- Shifted coordinates (relative to center) ---
+    df["C_start_shifted"] = df["C_start"] - df["center"]
+    df["read_start_shifted"] = df["read_start"] - df["center"]
+    df["read_end_shifted"] = df["read_end"] - df["center"]
+
+    # --- Optional filtering ---
+    stats = None
+    if filter_outliers:
+        # Per-read summary stats
+        stats = df.groupby("readid").agg(
+            start=("read_start_shifted", "first"),
+            end=("read_end_shifted", "first"),
+            n_cpg=("C_start_shifted", "count"),
+            min_c=("C_start_shifted", "min"),
+            max_c=("C_start_shifted", "max"),
+        )
+        stats["span"] = stats["end"] - stats["start"]
+
+        # Determine span threshold
+        if max_span_bp is None:
+            span_thr = stats["span"].quantile(span_quantile)
+        else:
+            span_thr = float(max_span_bp)
+
+        # Base mask
+        mask = (
+            (stats["n_cpg"] >= int(min_cpg)) &
+            (stats["span"] > 0) &
+            (stats["span"] <= span_thr)
+        )
+
+        # Require center to be inside
+        if require_center_inside:
+            mask &= (stats["start"] <= 0) & (stats["end"] >= 0)
+
+        # Constrain CpG window
+        if cpg_window_bp is not None:
+            w = float(cpg_window_bp)
+            mask &= (stats["min_c"] >= -w) & (stats["max_c"] <= w)
+
+        # Keep only valid reads
+        keep_reads = stats.index[mask]
+        df = df[df["readid"].isin(keep_reads)].copy()
+
+        # Return filtered stats if requested
+        if return_stats:
+            stats = stats.loc[keep_reads]
+
+    # --- Return ---
+    if return_stats:
+        return df, stats
+    else:
+        return df
+
+
+## 7. FUNCTION TO PLOT THE READS IN LONG FORMAT    
 
 def plot_reads_long(
     df,
@@ -439,7 +535,9 @@ def plot_reads_long(
     facet_by=None,
     color_by=None,
     hex_colors=None,
-    max_facets=14
+    gene='Gene',
+    max_facets=14,
+    figsize=None  # otherwise a tuple, for ex (30,20)
 ):
     """
     Plot per-read methylation (long format, one row per CpG per read), centered on Pol2 position.
@@ -504,7 +602,12 @@ def plot_reads_long(
     n_facets = len(facet_values)
     heights = [max(1, subdf["readid"].nunique() * 0.15) for _, subdf in facet_values]  # scale heights
     total_height = sum(heights) + 2  # add some padding
-    fig = plt.figure(figsize=(30, total_height))
+
+    if figsize is None:
+        fig = plt.figure(figsize=(30, total_height))
+    else:
+        fig = plt.figure(figsize=figsize)
+
     gs = gridspec.GridSpec(n_facets, 1, height_ratios=heights)
 
     # --- Plot each facet ---
@@ -535,8 +638,8 @@ def plot_reads_long(
 
             ax.hlines(
                 idx,
-                xmin=sub["read_start_shifted"].iloc[0],
-                xmax=sub["read_end_shifted"].iloc[0],
+                xmin=sub["read_start_shifted"].iloc[0]-100,
+                xmax=sub["read_end_shifted"].iloc[0]+100,
                 color=span_color,
                 linewidth=1.6
             )
@@ -544,7 +647,7 @@ def plot_reads_long(
             # CpG dots
             for _, row in sub.iterrows():
                 dot_color = "white" if row["meth"] == 1 else "black"
-                ax.plot(row["C_start_shifted"], idx, "o", color=dot_color, markersize=4)
+                ax.plot(row["C_start_shifted"], idx, "o", color=dot_color, markersize=3)
 
         # Vertical line at Pol2
         ax.axvline(x=0, color="#C80028", linestyle="-", linewidth=2, label="Pol2 position")
@@ -565,7 +668,7 @@ def plot_reads_long(
                 title = f"{facet_by[0]}={facet_key}"
         else:
             title = "All Reads"
-        ax.set_title(f"Read-level methylation centered on Pol2 ({title})", fontsize=16)
+        ax.set_title(f" {gene} : Read-level methylation centered on Pol2 ({title})", fontsize=16)
         ax.grid(True)
         ax.invert_yaxis()
 
@@ -583,10 +686,10 @@ def plot_reads_long(
     fig.tight_layout()
     plt.subplots_adjust(top=0.93, bottom=0.05)
 
-    return fig
+    # return fig
 
 
-## SMALL FUNCTION TO GET THE LIST OF ALL THE GENES NAMES OF A DATAFRAME AND THE LIST OF ALL THE SUBDATAFRAME OF THESE GENES
+## 8. SMALL FUNCTION TO GET THE LIST OF ALL THE GENES NAMES OF A DATAFRAME AND THE LIST OF ALL THE SUBDATAFRAME OF THESE GENES
 
 def get_genes_list(df):
     gene_list_names= [] #the list that will take in the genes names
@@ -598,157 +701,407 @@ def get_genes_list(df):
 
     return gene_list_names,gene_list_df
 
-## CLUSTERING ALOGRITHN FOLLOWING THE STEPS: PCA --> KNN GRAPH --> LEIDEN
+def get_groups_df_list(df):
+    group_list_names= [] #the list that will take in the groups names
+    group_list_df=[] #the list that will take in the dataframes associated to the groups
 
-def clustering(
-        df: pd.DataFrame,       
-        n_neighbors: int,   #to choose how many neighors for the kNN graph construction, before using leiden 
-        nan_threshold : float = 0.7, #to drop the bins that have too many nan
-        nan_method : str = 'drop', #by default dropping the rows that contain nan, but can use 'impute' too
-        knn_metric: str = 'euclidean',   # the metric used for computing the kNN graph construction. Can also be cosine for ex
-        leiden_resolution: float = 1.0 # the resolution of the leiden (small = less clusters)   
+    for group,sub_df in df.groupby(df.index.get_level_values("group")):
+        group_list_names.append(group)
+        group_list_df.append(sub_df)
+
+    return group_list_names, group_list_df
+
+## function called afterwards in clustering_final
+def compute_cluster_metrics(
+        X_pca: np.ndarray,
+        clusters: np.ndarray,
+        metric: str,
+        graph,            # igraph.Graph (g)
+        partition         # leidenalg partition (part)
+    ) -> dict:
+        """
+        Safe computation of clustering quality metrics.
+        - Returns None for silhouette/CH/DB when invalid (e.g., single cluster).
+        - Falls back to precomputed distances for silhouette if needed.
+        """
+        metrics = {}
+        labels = np.asarray(clusters)
+        n_labels = int(np.unique(labels).size)
+        n_samples = int(X_pca.shape[0])
+
+        # Silhouette: requires at least 2 clusters and n_samples >= 2
+        if n_labels >= 2 and n_samples >= 2:
+            try:
+                metrics['silhouette'] = float(silhouette_score(X_pca, labels, metric=metric))
+            except Exception:
+                try:
+                    D = pairwise_distances(X_pca, metric=metric)
+                    metrics['silhouette'] = float(silhouette_score(D, labels, metric='precomputed'))
+                except Exception:
+                    metrics['silhouette'] = None
+        else:
+            metrics['silhouette'] = None
+
+        # Calinski–Harabasz: requires at least 2 clusters
+        if n_labels >= 2 and n_samples >= 2:
+            try:
+                metrics['calinski_harabasz'] = float(calinski_harabasz_score(X_pca, labels))
+            except Exception:
+                metrics['calinski_harabasz'] = None
+        else:
+            metrics['calinski_harabasz'] = None
+
+        # Davies–Bouldin: requires at least 2 clusters
+        if n_labels >= 2 and n_samples >= 2:
+            try:
+                metrics['davies_bouldin'] = float(davies_bouldin_score(X_pca, labels))
+            except Exception:
+                metrics['davies_bouldin'] = None
+        else:
+            metrics['davies_bouldin'] = None
+
+        # Leiden objective value
+        try:
+            metrics['leiden_quality'] = float(partition.quality())
+        except Exception:
+            metrics['leiden_quality'] = None
+
+        # Weighted modularity
+        try:
+            metrics['modularity'] = graph.modularity(labels.tolist(), weights=graph.es['weight'])
+        except Exception:
+            metrics['modularity'] = None
+
+        # Cluster sizes
+        unique, counts = np.unique(labels, return_counts=True)
+        metrics['cluster_sizes'] = dict(zip(unique.tolist(), counts.tolist()))
+
+        return metrics
+
+# ------------------------------
+# Build positional weights
+# ------------------------------
+def build_positional_weights(
+    columns,                      # iterable of bin positions (e.g., DataFrame.columns)
+    window_bp: int = 500,         # half-window around center to emphasize (e.g., +/- 500 bp)
+    center: int = 0,              # Pol2 position (0 if already centered)
+    mode: str = "gaussian",       # 'gaussian' or 'box'
+    inside_weight: float = 1.0,   # weight inside window (for 'box')
+    outside_weight: float = 0.2,  # weight outside window (for 'box')
+    sigma_bp: float | None = None,# Gaussian sigma in bp (defaults to window_bp/2)
+    normalize_mean: bool = True        # normalize to mean ~ 1.0
+) -> pd.Series:
+    """
+    Create a positional weight vector indexed by columns (positions), emphasizing +/- window_bp around center.
+    Returns a pd.Series aligned to the provided columns.
+    """
+    pos = pd.to_numeric(pd.Series(list(columns), dtype=str).str.strip(), errors="coerce").astype(int)
+    if mode == "gaussian":
+        # Gaussian weighting: exp(- (pos - center)^2 / (2 * sigma^2))
+        sigma = (window_bp / 2.0) if sigma_bp is None else float(sigma_bp)
+        w = np.exp(-((pos - center) ** 2) / (2.0 * sigma ** 2))
+        w = outside_weight + (inside_weight - outside_weight) * w
+    elif mode == "box":
+        w = np.where(np.abs(pos - center) <= window_bp, inside_weight, outside_weight)
+    else:
+        raise ValueError("mode must be 'gaussian' or 'box'")
+
+    if normalize_mean:
+        mean_val = np.mean(w) if np.mean(w) > 0 else 1.0
+        w = w / mean_val
+    return pd.Series(w, index=pos)
+
+
+## 3. IMPROVED CLUSTERING ALGORITHM, FOLLOWING THE STEPS: PCA --> ADAPTIVE KNN GRAPH (WEIGHTED) --> LEIDEN
+def clustering_final(
+    df,
+    n_neighbors=15,
+    nan_threshold : float = 0.7, #to drop the bins that have too many nan
+    nan_method : str = 'drop', #by default dropping the rows that contain nan, but can use 'impute' too
+    scaling : bool = False, #whether to scale the data or not
+    pca_or_not = True, #whether to do a pca or not
+    n_pcs= None ,# if None: by default 0.95 variance, otherwise int number of pcs to keep if pca is done
+    metric='cosine', #cosine or euclidean
+    transform='none', # 'none', 'logit', or 'arcsine'
+    kernel_type='laplacian', # 'laplacian' or 'gaussian'
+    leiden_resolution=1.0,
+    seed=42,
+    pos_weights: pd.Series | None = None,     # built via build_positional_weights(df.columns, ...)
+    weight_stage: str = 'pre_pca'             # 'pre_pca' (default) or 'post_pca' (rare)
 ):
     """
-    Clustering algorithm
-    1. Handles the Nan values from the matrix-like dataframe
-    2. Converts the dataframe into a numpy array
-    3. Standardizes the values
-    4. Runs the PCA
-    5. creates a kNN graph
-    6. runs Leiden on the graph
+    Perform Leiden clustering on PCA-reduced data with adaptive similarity weighting.
+    And with optional positional weights (column-wise),
+    which emphasize bins around Pol2 by scaling features by sqrt(weight).
 
-    Parameters:
-    df: is a dataframe already binned and matrix-like, but simply has missing values in it, still,
-    n_neighbors: int: for the knn graph construction
-    nan_threshold: float: to drop the bins that have too many nan values
-    knn_metric: str metric used for knn graph construction
-    leiden_resolution: float 
+    pos_weights:
+        pd.Series indexed by df.columns (positions). If provided, applied as:
+        X *= sqrt(weight) per column at the specified stage (pre_pca recommended).
 
-    """
-    #Handling the NaN:
-    df= handling_NaN(df, nan_threshold, nan_method)
-    
-    #Converting into a np.array:
-    X = df.to_numpy()
-    
-    # Standardization of the features
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
-
-    #PCA
-    pca = PCA(n_components=2)
-    X_pca = pca.fit_transform(X)
-
-    # kNN graph construction
-    knn = NearestNeighbors(n_neighbors= n_neighbors, metric= knn_metric)
-    knn.fit(X_pca)
-    knn_distances, knn_indices = knn.kneighbors(X_pca)
-
-    # Create igraph (might change this function later with a manual coded function to create igraph)
-    edges = [(i, j) for i in range(knn_indices.shape[0]) for j in knn_indices[i, 1:]]
-    g= ig.Graph(edges=edges, directed=False)
-
-    # Run Leiden 
-    partition= la.find_partition(g, la.RBConfigurationVertexPartition, resolution_parameter= leiden_resolution, seed=42)   
-    clusters= np.array(partition.membership)
-
-    return df, X_pca, partition, clusters
-
-
-## SCATTER PLOT FUNCTION : VISUALIZATION OF THE CLUSTERING BASED ON UMAP FOR A SINGLE GENE (MADE FOR THE STUDY OF A PARTICULAR GENE)
-
-def plotting_the_clustering(
-        X: np.array, # can either be the matrix after the PCA was ran, so X_PCA, or the raw X. Usually, it's the one after the PCA is ran. (that's what scanpy does)
-        clusters : np.array, #should be the clusters given after running the leiden
-        n_neighbors: int = 15, #not necessarily the same number of neighbors as in the kNN graph computing (high value loses local structure)
-        min_dist: float = 0.1, # low value = more tightly packed embeddings
-        metric: str = 'euclidean' #should be the same as the one used in the knn graph
-
-):
-    reducer = umap.UMAP(n_neighbors= n_neighbors, min_dist=min_dist, metric=metric, random_state=42)
-    embedding = reducer.fit_transform(X)
-    
-    unique_clusters = np.unique(clusters)
-    
-    cluster_colors = { cluster_id: hex_colors[i % len(hex_colors)] for i, cluster_id in enumerate(unique_clusters)}
-
-    colors = [cluster_colors[c] for c in clusters]
-
-    fig= plt.figure(figsize=(12,8))
-    plt.scatter(embedding[:,0],
-            embedding[:,1],
-            c=colors,
-            alpha=0.8)
-    
-    plt.xlabel("UMAP1")
-    plt.ylabel("UMAP2")
-    plt.title("UMAP for X")
-    plt.grid(True)
-    
-    return fig
-
-
-## MULTIPLE SCATTER PLOTS : TO VISUALIZE THE CLUSTERING BASED ON UMAP OF ALL THE GENES AT THE SAME TIME
-
-def plot_multiple_umaps(df, genes_list, titles=None, leiden_neighbors= 15, umap_neighbors=15, resolution= 1.0, min_dist=0.1, leiden_metric = 'euclidean', umap_metric="euclidean"):
-    """
-    Plot multiple UMAP scatter plots in a checkerboard layout.
-    
     Parameters
     ----------
-    df: df_filtered, that is matrx like
+    df : pandas.DataFrame
+        Input data (numeric).
+    n_neighbors : int, default=15
+        Number of neighbors for kNN graph construction.
+    n_pcs : int, default=30
+        Number of principal components to retain.
+    metric : str, default='cosine'
+        Distance metric for nearest neighbors.
+    transform : {'none', 'logit', 'sqrt'}, default='none'
+        Optional transformation applied to data before PCA.
+    leiden_resolution : float, default=1.0
+        Resolution parameter for the Leiden algorithm.
+    seed : int, default=42
+        Random seed for reproducibility.
 
-    genes_list : list of array-like
-        List of genes label arrays (same length as X).
-    titles : list of str
-        Optional titles for each subplot.
-    n_neighbors, min_dist, metric : UMAP parameters
+    Returns
+    -------
+    clusters : np.ndarray
+        Cluster assignments for each observation.
+    part : leidenalg.Partition
+        Leiden partition object.
+    X_pca : np.ndarray
+        PCA-transformed coordinates.
     """
-
-    # Checkerboard size
-    n_plots = len(genes_list)
-    n_cols = int(np.ceil(np.sqrt(n_plots)))
-    n_rows = int(np.ceil(n_plots / n_cols))
-
-    # Create figure
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 5*n_rows))
-    axes = axes.flatten()
-
-    for i, genes in enumerate(genes_list):
-        # 
-        df_gene, X, partition, clusters = clustering(gene_df[i], leiden_neighbors, 0.7, 'drop', leiden_metric, resolution)
-
-        # Compute shared UMAP embedding
-        reducer = umap.UMAP(n_neighbors= umap_neighbors, min_dist=min_dist, metric=umap_metric, random_state=42)
-        embedding = reducer.fit_transform(X)
-
-        unique_clusters = np.unique(clusters)
     
-        cluster_colors = { cluster_id: hex_colors[i % len(hex_colors)] for i, cluster_id in enumerate(unique_clusters)}
+    # 0) Handle NaNs via your function
+    df_proc = handling_NaN(df, nan_threshold, nan_method)
 
-        colors = [cluster_colors[c] for c in clusters]
+    # 1) X matrix
+    X = df_proc.to_numpy(dtype=float)
+    if np.isnan(X).any():
+        raise ValueError("NaNs remain after handling_NaN; impute explicitly before PCA.")
 
-        sc = axes[i].scatter(embedding[:,0],
-            embedding[:,1],
-            c=colors,
-            alpha=0.8)
-        
-        axes[i].set_xlabel("UMAP1")
-        axes[i].set_ylabel("UMAP2")
-        title = titles[i] if titles else f"UMAP Clustering {genes}"
-        axes[i].set_title(title)
-        axes[i].grid(True)
+    # 2) Transform
+    if transform == 'logit':
+        Xc = np.clip(X, 1e-3, 1 - 1e-3)
+        Xc = np.log(Xc / (1 - Xc))
+    elif transform == 'arcsine':
+        Xc = np.arcsin(np.sqrt(np.clip(X, 0.0, 1.0)))
+    elif transform == 'none':
+        Xc = X
+    else:
+        raise ValueError("transform must be 'none', 'logit', or 'arcsine'")
 
-    # Hide unused subplots if any
-    for j in range(i+1, len(axes)):
-        axes[j].axis("off")
+    # 2b) Optional scaling (column-wise z-score) — usually keep False if using positional weights
+    if scaling:
+        scaler = StandardScaler(with_mean=True, with_std=True)
+        Xc = scaler.fit_transform(Xc)
 
+    # 2c) Apply positional weights (pre-PCA): Xc *= sqrt(weights) per column
+    if pos_weights is not None and weight_stage == 'pre_pca':
+        w_ser = pd.Series(pos_weights, index=df_proc.columns).reindex(df_proc.columns).astype(float).fillna(1.0)
+        sw = np.sqrt(np.maximum(w_ser.to_numpy(), 0.0))
+        Xc = Xc * sw[None, :]
+
+    # 3) PCA
+    if pca_or_not:
+        if n_pcs is None:
+            pca = PCA(n_components=0.95, svd_solver='auto', random_state=seed)
+        elif isinstance(n_pcs, int) and n_pcs > 0:
+            n_pcs = min(n_pcs, min(Xc.shape) - 1)
+            pca = PCA(n_components=n_pcs, svd_solver='auto', random_state=seed)
+        else:
+            raise ValueError("n_pcs must be None or positive int.")
+        X_pca = pca.fit_transform(np.nan_to_num(Xc, nan=0.0))
+        print("Number of components chosen:", pca.n_components_)
+    else:
+        X_pca = Xc  # no PCA
+
+    # 3b) Optional post-PCA weighting (rare; only if you specifically want to warp the embedding)
+    if pos_weights is not None and weight_stage == 'post_pca':
+        # Only makes sense if PCA wasn't used (feature space must align to original bins).
+        # Generally discouraged; prefer 'pre_pca'.
+        w_ser = pd.Series(pos_weights, index=df_proc.columns).reindex(df_proc.columns).astype(float).fillna(1.0)
+        sw = np.sqrt(np.maximum(w_ser.to_numpy(), 0.0))
+        # If no PCA, X_pca has same feature dimension as original columns.
+        if not pca_or_not and X_pca.shape[1] == sw.size:
+            X_pca = X_pca * sw[None, :]
+
+    # 3c) For cosine without PCA, L2-normalize rows (optional; cosine is scale-invariant)
+    if metric == 'cosine' and not pca_or_not:
+        X_pca = normalize(X_pca, norm='l2', axis=1)
+
+    N = X_pca.shape[0]
+
+
+    # 4) kNN graph
+    nn = NearestNeighbors(n_neighbors=n_neighbors, metric=metric)
+    nn.fit(X_pca)
+    dist, idx = nn.kneighbors(X_pca, return_distance=True)
+
+    # 5) Kernels
+    self_included = np.all(idx[:, 0] == np.arange(N))
+    eps = 1e-12
+    if kernel_type == 'laplacian':
+        dist_for_scale = dist[:, 1:] if self_included else dist
+        tau = np.median(dist_for_scale, axis=1) + 1e-6
+        sim = np.exp(-dist / tau[:, None])
+    elif kernel_type == 'gaussian':
+        sigma = dist[:, -1] + eps
+        sigma_j = sigma[idx]
+        sigma_i = sigma[:, None]
+        sim = np.exp(- (dist ** 2) / (sigma_i * sigma_j + eps))
+    else:
+        raise ValueError("kernel_type must be 'laplacian' or 'gaussian'")
+
+
+    # 6) Undirected weighted graph (union kNN with max weight)
+    edges = {}
+    for i in range(N):
+        if self_included:
+            neigh_idx = idx[i, 1:]; neigh_w = sim[i, 1:]
+        else:
+            neigh_idx = idx[i, :];  neigh_w = sim[i, :]
+
+        for j, w in zip(neigh_idx, neigh_w):
+            if i == j or w <= 0:
+                continue
+            a, b = (i, j) if i < j else (j, i)
+            edges[(a, b)] = max(edges.get((a, b), 0.0), float(w))
+
+    e_list = list(edges.keys())
+    w_list = [edges[e] for e in e_list]
+
+    g = ig.Graph(n=N, edges=e_list, directed=False)
+    g.es["weight"] = w_list
+
+    # 7) Leiden
+    part = la.find_partition(
+        g,
+        la.RBConfigurationVertexPartition,
+        weights=g.es['weight'],
+        resolution_parameter=leiden_resolution,
+        seed=seed
+    )
+    clusters = np.array(part.membership)
+
+    # 8) Metrics
+    metrics = compute_cluster_metrics(
+        X_pca=X_pca,
+        clusters=clusters,
+        metric=metric,
+        graph=g,
+        partition=part
+    )
+
+    return df_proc, X_pca, part, clusters, metrics
+
+
+## PLOTTING THE UMAP CLUSTERING
+
+def plot_umap(
+    X,
+    clusters,
+    n_neighbors=15,
+    min_dist=0.1,
+    metric='euclidean',      # for Pipeline 2, use 'euclidean'
+    transform=None,          # None | 'logit' | 'arcsine' (use only if X are raw proportions)
+    n_pcs=None,              # set if X are raw features; None if X are already PCs
+    standardize=False,       # True if using raw features without PCA
+    seed=42,
+    palette=None,            # optional list/array or matplotlib colormap name
+    title="UMAP embedding",
+    gene = 'Gene'
+):
+
+    X_in = np.asarray(X, dtype=float)
+
+    # Optional transform for proportions (only if X are raw fractions)
+    if transform is not None:
+        if transform == 'logit':
+            Xc = np.clip(X_in, 1e-3, 1 - 1e-3)
+            X_in = np.log(Xc / (1 - Xc))
+        elif transform == 'arcsine':
+            X_in = np.arcsin(np.sqrt(np.clip(X_in, 0.0, 1.0)))
+        else:
+            raise ValueError("transform must be None, 'logit', or 'arcsine'")
+
+    # Optional standardization (useful if running UMAP on raw features)
+    if standardize:
+        scaler = StandardScaler(with_mean=True, with_std=True)
+        X_in = scaler.fit_transform(X_in)
+
+    # Optional PCA (skip if X are already PCA scores)
+    if n_pcs is not None and 0 < n_pcs < X_in.shape[1]:
+        pca = PCA(n_components=n_pcs, random_state=seed)
+        X_umap = pca.fit_transform(X_in)
+    else:
+        X_umap = X_in
+
+    # Sanity checks for metric
+    if metric == 'jaccard':
+        # Warn if data are not binary
+        if not np.array_equal(X_umap, X_umap.astype(bool)) and not np.array_equal(
+            X_umap, (X_umap > 0).astype(int)
+        ):
+            raise ValueError(
+                "Jaccard metric requires binary data; "
+                "use euclidean/cosine/correlation for continuous features."
+            )
+
+    # UMAP embedding
+    reducer = umap.UMAP(
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        metric=metric,
+        random_state=seed
+    )
+    embedding = reducer.fit_transform(X_umap)
+
+    # Colors
+    unique_clusters = np.unique(clusters)
+    if palette is None:
+        # fallback to a matplotlib qualitative colormap
+        cmap = plt.get_cmap('tab20')
+        color_map = {c: cmap(i % cmap.N) for i, c in enumerate(unique_clusters)}
+    elif isinstance(palette, str):
+        cmap = plt.get_cmap(palette)
+        color_map = {c: cmap(i % cmap.N) for i, c in enumerate(unique_clusters)}
+    else:
+        # palette is a list/array
+        color_map = {c: palette[i % len(palette)] for i, c in enumerate(unique_clusters)}
+
+    colors = [color_map[c] for c in clusters]
+
+    # Plot
+    fig = plt.figure(figsize=(10, 7))
+    plt.scatter(
+        embedding[:, 0],
+        embedding[:, 1],
+        c=colors,
+        alpha=0.85,
+    )
+    plt.xlabel("UMAP1")
+    plt.ylabel("UMAP2")
+    plt.title(f'{gene} : {title}')
+    plt.grid()
+
+    # Legend
+    handles = [
+        plt.Line2D(
+            [0], [0],
+            marker='o',
+            color='w',
+            label=str(c),
+            markerfacecolor=color_map[c],
+            markersize=8
+        )
+        for c in unique_clusters
+    ]
+    plt.legend(
+        handles=handles,
+        title="Cluster",
+        bbox_to_anchor=(1.02, 1.0),
+        loc='upper left',
+        frameon=False
+    )
     plt.tight_layout()
-    
-    return fig
 
-## FUNCTION TO CREATE A DICTIONNARY THAT KEEPS TRACK OF THE ASSOCIATION READID, CLUSTER AND COLOR
+    return embedding, fig
 
+## 1. DICTIONNARY TO KEEP TRACK OF THE ASSOCIATION READID, CLUSTER AND COLOR
 def dict_id_cluster_color(
         df: pd.DataFrame,
         clusters : list,
@@ -778,9 +1131,7 @@ def dict_id_cluster_color(
     }
     return read_dict
 
-
-## FUNCTION TO TURN A DICTIONNARY INTO A DATAFRAME
-
+## 2. TRANSFORMING THE DICTIONNARY INTO A DATAFRAME
 def dict_to_df(
         read_dict: dict
 ):
@@ -795,15 +1146,14 @@ def dict_to_df(
     
     return df_dict
 
-
-## FUNCTION TO MERGE A DATAFRAME WITH THE DICTIONNARY-DATAFRAME
+## 3. MERGING THE DICTIONNARY DATAFRAME WITH THE ORIGINAL DATAFRAME (TO GET THE CLUSTER AND COLOR INFORMATION FOR EACH READ)
 def merge(
         df,
         df_dict: pd.DataFrame  
 ):
     # Ensure readid is a column
     if "readid" not in df.columns:
-        df = df.reset_index().rename(columns={"index": "readid"}).copy()
+        df_merged = df.reset_index().rename(columns={"index": "readid"}).copy()
     else:
         df_merged = df.copy()    
 
@@ -813,182 +1163,26 @@ def merge(
     
     return df_merged
 
-
-## FUNCTION TO PLOT THE AVERAGE METHYLATION PROFILE PER CLUSTER, USING THE COLORS ATTRIBUTED TO EACH CLUSTER
-
-def plot_avg_methylation_profile(
-    df: pd.DataFrame,
-    df_dict: pd.DataFrame,  # dataframe made out of the read_dict
-    start: int,
-    end: int,
-    center_coord: int,
-    read_dict: dict # {read_id: {'cluster': cluster_id, 'color': hex_color}}
+## 4. FUNCTION TO GET THE START, END AND CENTER COORDINATES OF A GENE
+def start_end_center(
+        df: pd.DataFrame
 ):
-    """
-    Plot average methylation profiles per cluster using cluster-specific colors.
+    if 'read_start' in df.columns and 'read_end' in df.columns and 'pol2_pos' in df.columns:
+        start = df['read_start'].min()
+        end = df['read_end'].max()
+        center_coord = df['pol2_pos'].unique()[0]  
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Each row = read, columns = genomic positions (bins), values = mean methylation (0-1)
-    start : int
-        Start genomic coordinate for plotting
-    end : int
-        End genomic coordinate for plotting
-    center_coord : int
-        Central position (e.g., Pol2)
-    partition : ig.VertexClustering
-        Clustering result (used to determine number of clusters if needed)
-    read_dict : dict
-        Mapping of read IDs to cluster and color: {read_id: {'cluster': id, 'color': '#hex'}}
-    """
-    # -------------------------
-    # Step 1: Prepare DataFrame
-    # -------------------------
-    df_avg= df.copy()
-    df_avg = df_avg.reset_index(level='readid', drop=False) 
-    df_avg.index = range(len(df_avg)) 
-
-    # -------------------------
-    # Step 2: Merge with df_map
-    # -------------------------
-    df_merged = pd.merge(df_avg, df_dict, on='readid', how='inner')
-
-    # -------------------------
-    # Step 3: Identify numeric position columns
-    # -------------------------
-    metadata_cols = ['readid', 'locus_cluster', 'locus_cluster_color']
-    position_cols = [col for col in df_merged.columns if col not in metadata_cols]
-    positions_sorted = sorted([int(col) for col in position_cols])
-
-    # -------------------------
-    # Step 4: Cluster colors mapping
-    # -------------------------
-    cluster_colors = {}
-    for rid, info in read_dict.items():
-        cid = int(info['cluster'])
-        if cid not in cluster_colors:
-            cluster_colors[cid] = info['color']
-
-    # -------------------------
-    # Step 5: Compute cluster proportions
-    # -------------------------
-    unique_clusters = sorted(df_merged['locus_cluster'].dropna().astype(int).unique())
-    n_clusters = len(unique_clusters)
-    proportion_df = (
-        df_merged['locus_cluster']
-        .value_counts(normalize=True)
-        .mul(100)
-        .reindex(unique_clusters, fill_value=0)
-        .reset_index(name="percentage")
-        .rename(columns={"index": "locus_cluster"})
-    )
-
-    # -------------------------
-    # Step 6: Create subplots
-    # -------------------------
-    height_ratios = proportion_df['percentage'].values
-    fig, axes = plt.subplots(n_clusters, 1, figsize=(10, 12), sharex=True,
-                             gridspec_kw={'height_ratios': height_ratios})
-    if n_clusters == 1:
-        axes = [axes]
-
-    # -------------------------
-    # Step 7: Plot each cluster
-    # -------------------------
-    for i, cluster_id in enumerate(unique_clusters):
-        ax = axes[i]
-        cluster_rows = df_merged[df_merged['locus_cluster'] == cluster_id]
-
-        if cluster_rows.empty:
-            continue
-
-        # Compute mean methylation only over position columns (integers!)
-        df_meth = cluster_rows[positions_sorted]
-        meth_sorted = df_meth.mean(axis=0).values
-
-        # Smoothing
-        meth_smooth = gaussian_filter1d(meth_sorted, sigma=0.5)
-
-        # Cluster color
-        color = cluster_rows['locus_cluster_color'].iloc[0]
-
-        # Plot
-
-        # Set background to black
-        ax.set_facecolor('black')
-
-        # # Fill under the curve with the cluster color
-        ax.fill_between(positions_sorted, meth_smooth, color=color)
-
-        # Optionally, overlay a line for contrast
-        # ax.plot(positions_sorted, meth_smooth, color='white', linewidth=1)
-
-        # Y-axis label with percentage
-        percentage = proportion_df.loc[
-            proportion_df['locus_cluster'] == cluster_id, 'percentage'
-        ].values[0]
-        ax.set_ylabel(f"Cluster {cluster_id} | {percentage:.1f}%", fontsize=8)
-
-        # Axis limits and grid
-        ax.set_ylim(0, 1.1)
-        ax.set_xlim(min(positions_sorted), max(positions_sorted))
-    
-        # Assign new labels
-        ax.set_xticklabels([str(start), "50", str(end)])
-        ax.grid(True, axis='x', linestyle='--', linewidth=0.5, color='gray')
-
-        # Reference lines
-        ax.axhline(y=1, color='grey', linestyle='--', linewidth=0.5)
-        ax.axvline(x=0, color="#C80028", linestyle="-", linewidth=2, label="Pol2 position")
-        ax.xaxis.set_major_locator(MultipleLocator(100))
+        return start, end, center_coord
+    else:
+        raise ValueError("DataFrame must contain 'read_start', 'read_end', and 'pol2_pos' columns.")
 
 
-    # -------------------------
-    # Step 8: Global labels & legend
-    # -------------------------
-    
-    # Show x tick labels only on the bottom axis
-    for ax in axes[:-1]:
-        ax.tick_params(labelbottom=False)
+## 1. TO COMPARE THE LOCUS SPECIFIC CLUSTERS RELATIVELY TO THE BULK CLUSTERS AND THE GROUPS
 
-    # Ticks every 100 on the bottom axis
-    axes[-1].xaxis.set_major_locator(MultipleLocator(100))
-
-    # Format bottom tick labels as absolute genomic coordinates
-    def rel_to_abs_label(x, pos):
-        # Optionally use thousands separators: f"{int(x + center_coord):,}"
-        return f"{int(x + center_coord)}"
-
-    axes[-1].xaxis.set_major_formatter(FuncFormatter(rel_to_abs_label))
-
-    # Hide any potential offset text
-    axes[-1].get_xaxis().get_offset_text().set_visible(False)
-
-    # Global labels & legend
-    fig.text(0.95, 0.5, 'Methylation level', va='center', ha='center', rotation=-90, fontsize=10)
-    fig.text(
-        0.05, 0.5,
-        "Cluster number | Cluster proportion\n(ordered by cluster mean methylation)",
-        fontsize=10, multialignment='center', rotation=90, va='center', ha='center'
-    )
-    fig.text(0.5, 0.04, "Genomic coordinate", va='center', ha='center', fontsize=10)
-
-    center_line = mlines.Line2D([], [], color='red', linestyle='-', linewidth=1, label='pol2 position')
-    fig.legend(handles=[center_line], loc='upper right', bbox_to_anchor=(0.97, 0.955), fontsize=9, frameon=False)
-
-    plt.subplots_adjust(hspace=0.05, top=0.92)
-    plt.setp(axes[-1].get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
-    axes[-1].tick_params(axis='x', labelsize=8)
-    fig.subplots_adjust(bottom=0.18)  # extra bottom margin to avoid clipping
-
-    plt.show()
-
-
-## FUNCTION TO CREATE TWO HEATMAPS THAT SUMMARIZE THE CLUSTERING RESULTS
 def summary(
         df: pd.DataFrame,
         clusters: list,
+        gene='Gene'
 ):
     df_summary = df.copy()
     df_summary['locus_cluster'] = clusters
@@ -998,13 +1192,24 @@ def summary(
     fig, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
 
     # --- First heatmap: per group (global percentages) ---
-    summary_per_group = (
-        df_summary[['locus_cluster']]
-        .groupby(df_summary.index.get_level_values('group'))['locus_cluster']
-        .value_counts()                           # raw counts
-        .div(total_reads).mul(100)                # convert to % of ALL reads (not relative to the number of reads per group, but all the reads)
-        .reset_index(name="percentage")
-    )
+    if 'group' in df_summary.index.names:
+        # group is part of the index
+        summary_per_group = (
+            df_summary[['locus_cluster']]
+            .groupby(df_summary.index.get_level_values('group'))['locus_cluster']
+            .value_counts()
+            .div(total_reads).mul(100)
+            .reset_index(name="percentage")
+        )
+    else:
+        # group is a normal column
+        summary_per_group = (
+            df_summary[['group', 'locus_cluster']]
+            .groupby('group')['locus_cluster']
+            .value_counts()
+            .div(total_reads).mul(100)
+            .reset_index(name="percentage")
+        )
 
     pivot_group = summary_per_group.pivot(
         index="group", columns="locus_cluster", values="percentage"
@@ -1016,13 +1221,25 @@ def summary(
     axes[0].set_title("Reads per cluster in each group (% of all reads)")
 
     # --- Second heatmap: per bulk cluster (global percentages) ---
-    summary_per_bulk_cluster = (
-        df_summary[['locus_cluster']]
-        .groupby(df_summary.index.get_level_values('cluster'))['locus_cluster']
-        .value_counts()
-        .div(total_reads).mul(100)
-        .reset_index(name="percentage")
-    )
+
+    if 'cluster' in df_summary.index.names:
+        # group is part of the index
+        summary_per_bulk_cluster = (
+            df_summary[['locus_cluster']]
+            .groupby(df_summary.index.get_level_values('cluster'))['locus_cluster']
+            .value_counts()
+            .div(total_reads).mul(100)
+            .reset_index(name="percentage")
+        )
+    else:
+        # group is a normal column
+        summary_per_bulk_cluster = (
+            df_summary[['cluster', 'locus_cluster']]
+            .groupby('cluster')['locus_cluster']
+            .value_counts()
+            .div(total_reads).mul(100)
+            .reset_index(name="percentage")
+        )
 
     pivot_cluster = summary_per_bulk_cluster.pivot(
         index="cluster", columns="locus_cluster", values="percentage"
@@ -1033,4 +1250,394 @@ def summary(
     axes[1].set_xlabel("Cluster")
     axes[1].set_title("Reads per cluster in each bulk cluster (% of all reads)")
 
+    plt.title(f'{gene} : Heatmaps of repartitions')
     plt.show()
+
+
+## IN ORDER TO GET THE AVERAGE METHYLATION ON BULK DATA 
+def compute_bulk_centroids(
+    df: pd.DataFrame,
+    use_cov_for_proportion: bool = True
+):
+    """
+    Compute per-cluster centroids across the entire bulk table.
+
+    Input df columns: ['cluster','C_pos','meth','cov'].
+    Returns:
+      P_df: clusters × bins matrix (mean methylation per bin)
+      cov_df: clusters × bins matrix (coverage per bin)
+      meta_df: per-cluster summary with ['cluster_id','n_rows_or_cov','proportion']
+      positions: sorted integer bin coordinates (C_pos)
+    """
+    required = {'cluster','C_pos','meth','cov'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Dataframe missing columns: {missing}")
+
+    d = df.copy()
+    d['C_pos'] = pd.to_numeric(d['C_pos'], errors='coerce')
+    d['meth']  = pd.to_numeric(d['meth'],  errors='coerce')
+    d['cov']   = pd.to_numeric(d['cov'],   errors='coerce')
+    d = d.dropna(subset=['cluster','C_pos','meth'])
+
+    # Aggregate duplicates at the same position within cluster
+    agg = (
+        d.groupby(['cluster','C_pos'], as_index=False)
+         .agg(meth_mean=('meth','mean'),
+              cov_agg=('cov','first'))  # use 'sum' if cov varies per row
+    )
+
+    # Pivot to wide: cluster × position
+    P_df = agg.pivot(index='cluster', columns='C_pos', values='meth_mean')
+    cov_df = agg.pivot(index='cluster', columns='C_pos', values='cov_agg')
+
+    # Sort columns and convert to ints
+    positions = np.array(sorted(P_df.columns.astype(int)), dtype=int)
+    P_df = P_df.reindex(columns=positions)
+    cov_df = cov_df.reindex(columns=positions)
+
+    # Proportions (height ratios)
+    g = d.groupby('cluster')
+    if use_cov_for_proportion:
+        cov_first = g['cov'].first()
+        cov_var   = g['cov'].var()
+        cov_tot   = g['cov'].sum() if np.nanmax(cov_var.fillna(0)) > 0 else cov_first
+        total_cov = float(cov_tot.sum()) if cov_tot.sum() is not None else 0.0
+        proportions = (cov_tot / (total_cov if total_cov > 0 else 1.0)) * 100.0
+        n_metric = cov_tot.astype(float)
+        n_label = 'cov_total'
+    else:
+        counts = g.size()
+        proportions = (counts / counts.sum()) * 100.0
+        n_metric = counts.astype(float)
+        n_label = 'n_rows'
+
+    meta_rows = []
+    for cid in P_df.index:
+        meta_rows.append({
+            'cluster_id': cid if isinstance(cid, (int, np.integer)) else str(cid),
+            n_label: float(n_metric.get(cid, np.nan)),
+            'proportion': float(proportions.get(cid, 0.0))
+        })
+    meta_df = pd.DataFrame(meta_rows).sort_values('cluster_id').reset_index(drop=True)
+
+    return P_df, cov_df, meta_df, positions
+
+## IN ORDER TO GET AVERAGE METHYLATION VALUE FOR SINGLE GENES
+
+def compute_gene_centroids(
+    df_reads: pd.DataFrame,
+    df_map: pd.DataFrame,  # ['readid', 'locus_cluster', 'locus_cluster_color']
+    gene_tss : str= None ,
+    group: str= None ,
+    read_id_col: str = 'readid',
+    cluster_col: str = 'locus_cluster',
+    color_col: str = 'locus_cluster_color',
+    extra_meta_cols: list | None = None  # e.g., ['gene_tss', 'group']
+):
+    """
+    Compute per-cluster average methylation per bin (and coverage) for one gene.
+
+    Returns
+    -------
+    profiles_df : pd.DataFrame
+        Mean methylation per cluster × bin.
+    coverage_df : pd.DataFrame
+        Number of reads with non-NaN methylation per cluster × bin.
+    meta_df : pd.DataFrame
+        Metadata for each cluster: [gene_tss, cluster_id, n_reads, proportion, color].
+    positions : np.ndarray
+        Sorted numeric bin positions (integers).
+    """
+    # --- Ensure read IDs are present as a column ---
+    if read_id_col not in df_reads.columns:
+        df_w = df_reads.reset_index().rename(columns={'index': read_id_col})
+    else:
+        df_w = df_reads.copy()
+
+    # --- Merge cluster/color mapping ---
+    dfg = pd.merge(
+        df_w,
+        df_map[[read_id_col, cluster_col, color_col]],
+        on=read_id_col,
+        how='inner'
+    )
+
+    if dfg.empty:
+        raise ValueError("No overlapping reads between df_reads and df_map.")
+
+    # --- Identify metadata columns ---
+    meta_cols = {read_id_col, cluster_col, color_col}
+    if extra_meta_cols:
+        meta_cols |= set(extra_meta_cols)
+
+    # --- Select candidate bin columns ---
+    candidate_cols = [c for c in dfg.columns if c not in meta_cols]
+
+    # --- Keep only columns with numeric names AND numeric data ---
+    def int_like(name):
+        return (
+            isinstance(name, (int, np.integer))
+            or (isinstance(name, str) and name.strip().lstrip('-').isdigit())
+        )
+
+    bin_cols_num = []
+    positions = []
+    for c in candidate_cols:
+        if int_like(c) and pd.api.types.is_numeric_dtype(dfg[c]):
+            bin_cols_num.append(c)
+            positions.append(int(c) if not isinstance(c, (int, np.integer)) else int(c))
+
+    if not bin_cols_num:
+        raise ValueError(
+            "No numeric bin columns found. Check df_reads columns and extra_meta_cols."
+        )
+
+    positions = np.array(sorted(positions), dtype=int)
+
+    # --- Build clean numeric-column version ---
+    col_map = {
+        c: (int(c) if not isinstance(c, (int, np.integer)) else int(c))
+        for c in bin_cols_num
+    }
+    dfg_bins = dfg[[cluster_col, color_col] + bin_cols_num].rename(columns=col_map)
+    dfg_bins = dfg_bins[[cluster_col, color_col] + positions.tolist()]
+
+    # --- Group by cluster and compute stats ---
+    profiles = {}
+    coverage = {}
+    colors = {}
+    counts_per_cluster = {}
+
+    for cid, sub in dfg_bins.groupby(cluster_col):
+        vals = sub[positions]
+        profiles[cid] = vals.mean(axis=0, skipna=True)
+        coverage[cid] = vals.notna().sum(axis=0)
+        colors[cid] = (
+            sub[color_col].iloc[0]
+            if color_col in sub.columns and not sub[color_col].isna().all()
+            else None
+        )
+        counts_per_cluster[cid] = int(len(sub))
+
+    profiles_df = pd.DataFrame(profiles).T.reindex(columns=positions)
+    coverage_df = pd.DataFrame(coverage).T.reindex(columns=positions)
+
+    profiles_df.index.name = 'cluster'
+    profiles_df.columns.name = 'C_pos'
+
+    # --- Build meta table ---
+    total_reads = sum(counts_per_cluster.values())
+    meta_rows = []
+    for cid in profiles_df.index:
+        n_reads = counts_per_cluster.get(cid, 0)
+        pct = (n_reads / total_reads * 100.0) if total_reads > 0 else 0.0
+
+        if gene_tss is not None :
+            meta_rows.append({
+                'gene_tss': gene_tss,
+                'cluster_id': int(cid),
+                'n_reads': int(n_reads),
+                'proportion': float(pct),
+                'cluster_color': colors.get(cid)
+            })
+        elif group is not None :
+            meta_rows.append({
+                'group': group,
+                'cluster_id': int(cid),
+                'n_reads': int(n_reads),
+                'proportion': float(pct),
+                'cluster_color': colors.get(cid)
+            })
+        else:
+            meta_rows.append({
+                'cluster_id': int(cid),
+                'n_reads': int(n_reads),
+                'proportion': float(pct),
+                'cluster_color': colors.get(cid)
+            })
+
+    meta_df = (
+        pd.DataFrame(meta_rows)
+        .sort_values('cluster_id')
+        .reset_index(drop=True)
+    )
+
+
+    return profiles_df, coverage_df, meta_df, positions
+
+## TO PLOT THE AVERAGE METHYLATION PATTERN
+
+def plot_centroids_with_shading(
+    P_df: pd.DataFrame,                 # index = cluster_id, columns = positions (int), values = mean methylation
+    positions: np.ndarray,              # sorted integer positions
+    meta_df: pd.DataFrame,              # must include ['cluster_id', 'proportion']; optional ['n_reads', 'cluster_color']
+    coverage_df: pd.DataFrame | None = None,  # same shape as P_df; per-bin contributing read counts
+    hex_colors=None,
+    proportional_height: bool = True,  # if True, cluster panel heights proportional to 'proportion' in meta_df
+    smooth_sigma: float = 0.5,
+    start: int | None = None,
+    end: int | None = None,
+    title: str = "Average DNA Methylation Profiles per Cluster",
+    show_pol2_line: bool = True,
+    shade_missing: bool = True,          # enable/disable shading
+    missingness_threshold: float = 0.7,  # shade sites where missingness >= threshold
+    bin_width: int | None = None         # if None, inferred from median bin spacing
+):
+    # --- Clusters and proportions ---
+    clusters = list(P_df.index)
+    n_clusters = len(clusters)
+
+    if 'proportion' in meta_df.columns:
+        prop_map = {int(row['cluster_id']): float(row['proportion'])
+                    for _, row in meta_df.iterrows()}
+    else:
+        prop_map = {int(cid): 100.0 / max(n_clusters, 1) for cid in clusters}
+
+    # --- Colors ---
+    if 'cluster_color' in meta_df.columns and meta_df['cluster_color'].notna().any():
+        color_map = {int(row['cluster_id']): row['cluster_color']
+                     for _, row in meta_df.iterrows()}
+    else:
+        import matplotlib.cm as cm
+        if hex_colors is None:
+            cmap = cm.get_cmap('tab20', n_clusters)
+            hex_colors = [cm.colors.to_hex(cmap(i)) for i in range(n_clusters)]
+
+        color_map = {cid: hex_colors[i % len(hex_colors)]
+                     for i, cid in enumerate(clusters)}
+        
+    # Ensure meta_df has a 'cluster_color' column and fill (preserve existing, fill missing)
+    if 'cluster_color' not in meta_df.columns:
+        meta_df['cluster_color'] = np.nan
+
+    meta_df['cluster_color'] = meta_df['cluster_color'].fillna(meta_df['cluster_id'].map(color_map))
+
+    # --- Height ratios from proportions ---
+    height_ratios = [max(1e-3, float(prop_map.get(int(cid), 0.0)))
+                     for cid in clusters]
+
+    # --- Infer bin width ---
+    if bin_width is None and len(positions) > 1:
+        diffs = np.diff(positions)
+        bin_width = int(np.median(diffs)) if len(diffs) else 1
+    if bin_width is None:
+        bin_width = 1
+
+    # --- Estimate per-cluster size for missingness ---
+    n_reads_map = {}
+    if 'n_reads' in meta_df.columns:
+        n_reads_map = {int(row['cluster_id']): int(row['n_reads'])
+                       for _, row in meta_df.iterrows()}
+    elif coverage_df is not None:
+        for cid in clusters:
+            try:
+                n_reads_map[int(cid)] = int(np.nanmax(
+                    coverage_df.loc[cid].to_numpy(float)))
+            except Exception:
+                n_reads_map[int(cid)] = 0
+
+    # --- Create figure --- if i want the cluster profiles height to be proportional to the number of reads
+    if proportional_height:
+        fig, axes = plt.subplots(
+            n_clusters, 1, 
+            figsize=(8, 10), 
+            sharex=True,
+            gridspec_kw={'height_ratios': height_ratios}
+        )
+
+    elif not proportional_height:
+    # create figure for everything is of the same height:
+        panel_height_in = 2.0  # height per cluster panel (inches), adjust as needed
+
+        fig, axes = plt.subplots(
+            n_clusters, 1,
+            figsize=(16, panel_height_in * max(1, n_clusters)),  # total height scales with number of clusters
+            sharex=True,
+            gridspec_kw={'height_ratios': [1] * n_clusters}      # equal height for all panels
+        )
+
+    if n_clusters == 1:
+        axes = [axes]
+
+    fig.suptitle(title, fontsize=14, y=0.97)
+
+    # --- Plot each cluster ---
+    for i, cid in enumerate(clusters):
+        ax = axes[i]
+        y = P_df.loc[cid].to_numpy(float)
+        x = positions
+        y_smooth = (gaussian_filter1d(y, sigma=float(smooth_sigma))
+                    if smooth_sigma and smooth_sigma > 0 else y)
+
+        # --- Shading of high missingness sites ---
+        if shade_missing and coverage_df is not None:
+            cs = int(n_reads_map.get(int(cid), 0))
+            if cs > 0:
+                cov = coverage_df.loc[cid].to_numpy(float)
+                miss_frac = 1.0 - (cov / cs)
+                mask = miss_frac >= float(missingness_threshold)
+
+                runs = []
+                run_start = None
+                prev = None
+                for p, ok in zip(x, mask):
+                    if ok and run_start is None:
+                        run_start = p
+                        prev = p
+                    elif ok:
+                        prev = p
+                    elif (not ok) and run_start is not None:
+                        runs.append((run_start, prev))
+                        run_start = None
+                if run_start is not None:
+                    runs.append((run_start, prev))
+
+                for a, b in runs:
+                    ax.axvspan(a - bin_width / 2, b + bin_width / 2,
+                               color="#969696", alpha=0.7, zorder=0.9)
+
+        # --- Plot profile ---
+        ax.set_facecolor(color_map.get(cid, '#cccccc'))
+        ax.fill_between(x, y_smooth, color='white')
+
+        # --- Axes, labels ---
+        pct = float(prop_map.get(int(cid), 0.0))
+        ax.set_ylabel(f"Cluster {cid} | {pct:.1f}%", fontsize=8)
+        ax.set_ylim(0, 1.05)
+
+        x_min = np.nanmin(x) if start is None else start
+        x_max = np.nanmax(x) if end is None else end
+        ax.set_xlim(x_min, x_max)
+
+        ax.grid(True, axis='x', linestyle='--',
+                linewidth=0.5, color='gray')
+        if show_pol2_line:
+            ax.axvline(x=0, color="#C80028", linestyle="-", linewidth=2)
+
+    # --- Shared x-axis formatting ---
+    for ax in axes[:-1]:
+        ax.tick_params(labelbottom=False)
+    axes[-1].xaxis.set_major_locator(MultipleLocator(100))
+    axes[-1].xaxis.set_major_formatter(FuncFormatter(lambda v, pos: f"{int(v)}"))
+    axes[-1].get_xaxis().get_offset_text().set_visible(False)
+
+    # --- Global labels ---
+    fig.text(0.95, 0.5, 'Methylation level',
+             va='center', ha='center', rotation=-90, fontsize=10)
+    fig.text(0.05, 0.5, "Cluster number | Cluster proportion",
+             fontsize=10, rotation=90, va='center', ha='center')
+    fig.text(0.5, 0.04, "Genomic coordinate",
+             va='center', ha='center', fontsize=10)
+
+    plt.subplots_adjust(hspace=0.05, top=0.92)
+    plt.setp(axes[-1].get_xticklabels(), rotation=45,
+             ha='right', rotation_mode='anchor')
+    axes[-1].tick_params(axis='x', labelsize=8)
+    fig.subplots_adjust(bottom=0.18)
+
+    plt.show()
+    return fig, axes
+
+if __name__ == "__main__":
+    pass
