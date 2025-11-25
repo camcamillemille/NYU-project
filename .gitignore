@@ -22,3 +22,6 @@ __pycache__/
 # Logs and temporary files
 *.log
 *.tmp
+notebooks/Project Scienta lab Tristan Montalbetti.ipynb
+scripts/Extraction_formatting_single_BED_CTCF.sh
+scripts/QC_processing_20251113.sh
